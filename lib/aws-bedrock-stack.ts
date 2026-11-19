@@ -12,6 +12,9 @@ import * as lambdaNodejs from "aws-cdk-lib/aws-lambda-nodejs";
 import * as s3n from "aws-cdk-lib/aws-s3-notifications";
 import * as apigwv2 from "aws-cdk-lib/aws-apigatewayv2";
 import { HttpLambdaIntegration } from "aws-cdk-lib/aws-apigatewayv2-integrations";
+import * as sqs from "aws-cdk-lib/aws-sqs";
+import * as lambdaEventSources from "aws-cdk-lib/aws-lambda-event-sources";
+import * as dynamodb from "aws-cdk-lib/aws-dynamodb";
 
 export class AwsBedrockStack extends cdk.Stack {
   constructor(scope: Construct, id: string, props?: cdk.StackProps) {
@@ -50,11 +53,19 @@ export class AwsBedrockStack extends cdk.Stack {
       bucketArn: documentBucket.bucketArn,
     });
 
-    // 7) Lambda that starts Bedrock ingestion after file upload
+    // 7) Create ingestion queue
+    const ingestionQueue = this.createIngestionQueue();
+
+    // 8.1) create ingestion table to store state of the ingestion
+    const ingestionStateTable = this.createIngestionStateTable();
+
+    // 8.2) Lambda that starts Bedrock ingestion after file upload
     const ingestionLambda = this.createIngestionLambda({
       knowledgeBaseId: knowledgeBase.attrKnowledgeBaseId,
       dataSourceId: dataSource.attrDataSourceId,
       documentBucket,
+      ingestionQueue,
+      ingestionStateTable,
     });
 
     // 8) Keep the resource creation order explicit
@@ -221,6 +232,8 @@ export class AwsBedrockStack extends cdk.Stack {
     knowledgeBaseId: string;
     dataSourceId: string;
     documentBucket: s3.Bucket;
+    ingestionQueue: sqs.Queue;
+    ingestionStateTable: dynamodb.Table;
   }): lambdaNodejs.NodejsFunction {
     const ingestionLambda = new lambdaNodejs.NodejsFunction(
       this,
@@ -230,13 +243,18 @@ export class AwsBedrockStack extends cdk.Stack {
         handler: "handler",
         runtime: lambda.Runtime.NODEJS_22_X,
         timeout: cdk.Duration.minutes(1),
+        reservedConcurrentExecutions: 1, // avoid parallel execution
         environment: {
           KNOWLEDGE_BASE_ID: params.knowledgeBaseId,
           DATA_SOURCE_ID: params.dataSourceId,
+          INGESTION_STATE_TABLE_NAME: params.ingestionStateTable.tableName,
         },
       },
     );
+    // Grant ingestion Lambda permission to access the table
+    params.ingestionStateTable.grantReadWriteData(ingestionLambda);
 
+    // Permission to start Bedrock ingestion
     ingestionLambda.addToRolePolicy(
       new iam.PolicyStatement({
         effect: iam.Effect.ALLOW,
@@ -247,10 +265,24 @@ export class AwsBedrockStack extends cdk.Stack {
       }),
     );
 
+    // Allow Lambda to consume SQS messages
+    params.ingestionQueue.grantConsumeMessages(ingestionLambda);
+
+    // Connect SQS to Lambda
+    ingestionLambda.addEventSource(
+      new lambdaEventSources.SqsEventSource(params.ingestionQueue, {
+        batchSize: 1,
+        reportBatchItemFailures: true,
+      }),
+    );
+
+    // Connect S3 to SQS
     params.documentBucket.addEventNotification(
       s3.EventType.OBJECT_CREATED,
-      new s3n.LambdaDestination(ingestionLambda),
-      { prefix: "content/" },
+      new s3n.SqsDestination(params.ingestionQueue),
+      {
+        prefix: "content/",
+      },
     );
 
     return ingestionLambda;
@@ -377,5 +409,40 @@ export class AwsBedrockStack extends cdk.Stack {
     );
 
     return askQuestionLambda;
+  }
+
+  private createIngestionQueue(): sqs.Queue {
+    const deadLetterQueue = new sqs.Queue(this, "IngestionDeadLetterQueue", {
+      queueName: "bedrock-ingestion-dlq",
+      retentionPeriod: cdk.Duration.days(14),
+    });
+
+    const ingestionQueue = new sqs.Queue(this, "IngestionQueue", {
+      queueName: "bedrock-ingestion-queue",
+      visibilityTimeout: cdk.Duration.minutes(6),
+      retentionPeriod: cdk.Duration.days(4),
+      deadLetterQueue: {
+        queue: deadLetterQueue,
+        maxReceiveCount: 5,
+      },
+    });
+
+    return ingestionQueue;
+  }
+
+  private createIngestionStateTable(): dynamodb.Table {
+    return new dynamodb.Table(this, "IngestionStateTable", {
+      tableName: "bedrock-ingestion-state",
+
+      partitionKey: {
+        name: "pk",
+        type: dynamodb.AttributeType.STRING,
+      },
+
+      billingMode: dynamodb.BillingMode.PAY_PER_REQUEST,
+
+      // development environment to minimise cost. For production update policy to RETAIN
+      removalPolicy: cdk.RemovalPolicy.DESTROY,
+    });
   }
 }

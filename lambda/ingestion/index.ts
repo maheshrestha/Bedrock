@@ -1,48 +1,63 @@
-import {
-  BedrockAgentClient,
-  StartIngestionJobCommand,
-} from "@aws-sdk/client-bedrock-agent";
+import type { SQSEvent, S3Event } from "aws-lambda";
+import { DynamoDBClient } from "@aws-sdk/client-dynamodb";
+import { DynamoDBDocumentClient, UpdateCommand } from "@aws-sdk/lib-dynamodb";
 
-import type { S3Event } from "aws-lambda";
-import { randomUUID } from "node:crypto";
+const client = new DynamoDBClient({});
+const dynamodb = DynamoDBDocumentClient.from(client);
 
-const bedrockClient = new BedrockAgentClient({});
-
+const tableName = process.env.INGESTION_STATE_TABLE_NAME!;
 const knowledgeBaseId = process.env.KNOWLEDGE_BASE_ID!;
 const dataSourceId = process.env.DATA_SOURCE_ID!;
 
-export const handler = async (event: S3Event) => {
-  console.log("S3 upload event:", JSON.stringify(event));
+export const handler = async (event: SQSEvent) => {
+  console.log("Ingestion Lambda started");
 
-  // Only process uploads under content/
-  const hasContentUpload = event.Records.some((record) => {
-    const key = decodeURIComponent(record.s3.object.key.replace(/\+/g, " "));
+  const pk = `${knowledgeBaseId}#${dataSourceId}`;
 
-    return key.startsWith("content/");
-  });
+  for (const message of event.Records) {
+    console.log("SQS message received:", message.messageId);
 
-  if (!hasContentUpload) {
-    console.log("No content uploads found.");
-    return;
+    const s3Event = JSON.parse(message.body) as S3Event;
+
+    for (const record of s3Event.Records ?? []) {
+      const bucket = record.s3.bucket.name;
+
+      const key = decodeURIComponent(record.s3.object.key.replace(/\+/g, " "));
+      if (key === "content/" || key.endsWith("/")) {
+        console.log("Skipping folder marker:", key);
+        continue;
+      }
+
+      console.log("Document uploaded:", { bucket, key });
+
+      // Increment generation atomically.
+      await dynamodb.send(
+        new UpdateCommand({
+          TableName: tableName,
+          Key: { pk },
+          UpdateExpression: `
+            SET #state = if_not_exists(#state, :idle),
+                #updatedAt = :now
+            ADD #generation :one
+          `,
+          ExpressionAttributeNames: {
+            "#state": "state",
+            "#updatedAt": "updatedAt",
+            "#generation": "generation",
+          },
+          ExpressionAttributeValues: {
+            ":idle": "IDLE",
+            ":now": new Date().toISOString(),
+            ":one": 1,
+          },
+        }),
+      );
+    }
   }
 
-  // Ask Bedrock to synchronise the S3 data source.
-  const response = await bedrockClient.send(
-    new StartIngestionJobCommand({
-      knowledgeBaseId,
-      dataSourceId,
-      clientToken: randomUUID(),
-      description: "Synchronise newly uploaded documents",
-    }),
-  );
-
-  console.log("Ingestion job started:", {
-    ingestionJobId: response.ingestionJob?.ingestionJobId,
-    status: response.ingestionJob?.status,
-  });
+  console.log("All S3 upload events recorded in DynamoDB");
 
   return {
-    message: "Knowledge Base ingestion started",
-    ingestionJobId: response.ingestionJob?.ingestionJobId,
+    message: "Upload events recorded successfully",
   };
 };
