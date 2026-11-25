@@ -1,6 +1,7 @@
 import type { SQSEvent, S3Event } from "aws-lambda";
 import { DynamoDBClient } from "@aws-sdk/client-dynamodb";
 import { DynamoDBDocumentClient, UpdateCommand } from "@aws-sdk/lib-dynamodb";
+import { SFNClient, StartExecutionCommand } from "@aws-sdk/client-sfn";
 
 const client = new DynamoDBClient({});
 const dynamodb = DynamoDBDocumentClient.from(client);
@@ -9,11 +10,15 @@ const tableName = process.env.INGESTION_STATE_TABLE_NAME!;
 const knowledgeBaseId = process.env.KNOWLEDGE_BASE_ID!;
 const dataSourceId = process.env.DATA_SOURCE_ID!;
 
+const sfn = new SFNClient();
+const stateMachineArn = process.env.INGESTION_STATE_MACHINE_ARN!;
+
 export const handler = async (event: SQSEvent) => {
   console.log("Ingestion Lambda started");
 
   const pk = `${knowledgeBaseId}#${dataSourceId}`;
 
+  let recordedUpload = false;
   for (const message of event.Records) {
     console.log("SQS message received:", message.messageId);
 
@@ -52,7 +57,18 @@ export const handler = async (event: SQSEvent) => {
           },
         }),
       );
+
+      recordedUpload = true;
     }
+  }
+
+  if (recordedUpload) {
+    await sfn.send(
+      new StartExecutionCommand({
+        stateMachineArn,
+        name: `ingestion-${Date.now()}-${crypto.randomUUID()}`,
+      }),
+    );
   }
 
   console.log("All S3 upload events recorded in DynamoDB");

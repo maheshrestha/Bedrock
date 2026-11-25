@@ -15,6 +15,8 @@ import { HttpLambdaIntegration } from "aws-cdk-lib/aws-apigatewayv2-integrations
 import * as sqs from "aws-cdk-lib/aws-sqs";
 import * as lambdaEventSources from "aws-cdk-lib/aws-lambda-event-sources";
 import * as dynamodb from "aws-cdk-lib/aws-dynamodb";
+import * as sfn from "aws-cdk-lib/aws-stepfunctions";
+import * as tasks from "aws-cdk-lib/aws-stepfunctions-tasks";
 
 export class AwsBedrockStack extends cdk.Stack {
   constructor(scope: Construct, id: string, props?: cdk.StackProps) {
@@ -46,30 +48,46 @@ export class AwsBedrockStack extends cdk.Stack {
       vectorIndexName,
     });
 
+    knowledgeBase.node.addDependency(vectorIndex);
+    knowledgeBase.node.addDependency(knowledgeBaseRole);
+
     // 6) Data source for S3 document ingestion
     const dataSource = this.createDataSource({
       knowledgeBase,
-      knowledgeBaseId: knowledgeBase.attrKnowledgeBaseId,
       bucketArn: documentBucket.bucketArn,
     });
 
-    // 7) Create ingestion queue
+    // 7. Create ingestion queue
     const ingestionQueue = this.createIngestionQueue();
 
-    // 8.1) create ingestion table to store state of the ingestion
+    // 8. Create DynamoDB ingestion state table
     const ingestionStateTable = this.createIngestionStateTable();
 
-    // 8.2) Lambda that starts Bedrock ingestion after file upload
+    // 9. Create coordinator Lambda
+    const coordinatorLambda = this.createCoordinatorLambda({
+      knowledgeBaseId: knowledgeBase.attrKnowledgeBaseId,
+      dataSourceId: dataSource.attrDataSourceId,
+      ingestionStateTable,
+    });
+
+    // 10. Create Step Functions state machine
+    const ingestionStateMachine = this.createIngestionStateMachine({
+      coordinatorLambda,
+      knowledgeBaseId: knowledgeBase.attrKnowledgeBaseId,
+      dataSourceId: dataSource.attrDataSourceId,
+    });
+
+    // 11. Create dispatcher Lambda
     const ingestionLambda = this.createIngestionLambda({
       knowledgeBaseId: knowledgeBase.attrKnowledgeBaseId,
       dataSourceId: dataSource.attrDataSourceId,
       documentBucket,
       ingestionQueue,
       ingestionStateTable,
+      stateMachineArn: ingestionStateMachine.stateMachineArn,
     });
 
     // 8) Keep the resource creation order explicit
-    knowledgeBase.node.addDependency(vectorIndex);
     dataSource.node.addDependency(knowledgeBase);
 
     // 9) Access permissions for Bedrock and the ingestion flow
@@ -144,7 +162,7 @@ export class AwsBedrockStack extends cdk.Stack {
 
     const vectorIndexName = "my-vector-index";
     const vectorIndex = new s3vectors.CfnIndex(this, "MyVectorIndex", {
-      vectorBucketName: vectorBucket.vectorBucketName,
+      // vectorBucketName: vectorBucket.vectorBucketName,
       indexName: vectorIndexName,
       dataType: "float32",
       dimension: 1024,
@@ -209,14 +227,13 @@ export class AwsBedrockStack extends cdk.Stack {
 
   private createDataSource(params: {
     knowledgeBase: bedrock.CfnKnowledgeBase;
-    knowledgeBaseId: string;
     bucketArn: string;
   }): bedrock.CfnDataSource {
     const dataSource = new bedrock.CfnDataSource(this, "CustomDataSource", {
-      knowledgeBaseId: params.knowledgeBaseId,
+      knowledgeBaseId: params.knowledgeBase.attrKnowledgeBaseId,
       name: "S3DataSource",
       dataSourceConfiguration: {
-        type: "S3",
+        type: "S3", // allowed values: S3 | CONFLUENCE | SALESFORCE | SHAREPOINT | WEB | CUSTOM | REDSHIFT_METADATA | MANAGED_KNOWLEDGE_BASE_CONNECTOR
         s3Configuration: {
           bucketArn: params.bucketArn,
           inclusionPrefixes: ["content/"],
@@ -234,6 +251,7 @@ export class AwsBedrockStack extends cdk.Stack {
     documentBucket: s3.Bucket;
     ingestionQueue: sqs.Queue;
     ingestionStateTable: dynamodb.Table;
+    stateMachineArn: string;
   }): lambdaNodejs.NodejsFunction {
     const ingestionLambda = new lambdaNodejs.NodejsFunction(
       this,
@@ -243,25 +261,24 @@ export class AwsBedrockStack extends cdk.Stack {
         handler: "handler",
         runtime: lambda.Runtime.NODEJS_22_X,
         timeout: cdk.Duration.minutes(1),
-        reservedConcurrentExecutions: 1, // avoid parallel execution
+        // reservedConcurrentExecutions: 1, // avoid parallel execution
         environment: {
           KNOWLEDGE_BASE_ID: params.knowledgeBaseId,
           DATA_SOURCE_ID: params.dataSourceId,
           INGESTION_STATE_TABLE_NAME: params.ingestionStateTable.tableName,
+          INGESTION_STATE_MACHINE_ARN: params.stateMachineArn,
         },
       },
     );
+
     // Grant ingestion Lambda permission to access the table
     params.ingestionStateTable.grantReadWriteData(ingestionLambda);
 
-    // Permission to start Bedrock ingestion
+    // Allow this Lambda to start the coordinator workflow.
     ingestionLambda.addToRolePolicy(
       new iam.PolicyStatement({
-        effect: iam.Effect.ALLOW,
-        actions: ["bedrock:StartIngestionJob"],
-        resources: [
-          `arn:aws:bedrock:${this.region}:${this.account}:knowledge-base/${params.knowledgeBaseId}`,
-        ],
+        actions: ["states:StartExecution"],
+        resources: [params.stateMachineArn],
       }),
     );
 
@@ -280,9 +297,7 @@ export class AwsBedrockStack extends cdk.Stack {
     params.documentBucket.addEventNotification(
       s3.EventType.OBJECT_CREATED,
       new s3n.SqsDestination(params.ingestionQueue),
-      {
-        prefix: "content/",
-      },
+      { prefix: "content/" },
     );
 
     return ingestionLambda;
@@ -297,6 +312,7 @@ export class AwsBedrockStack extends cdk.Stack {
     vectorBucket: s3vectors.CfnVectorBucket;
     embeddingModelArn: string;
   }): void {
+    // 1. Embedding model access
     params.knowledgeBaseRole.addToPolicy(
       new iam.PolicyStatement({
         effect: iam.Effect.ALLOW,
@@ -305,6 +321,21 @@ export class AwsBedrockStack extends cdk.Stack {
       }),
     );
 
+    // 2a. Source bucket: listing
+    params.knowledgeBaseRole.addToPolicy(
+      new iam.PolicyStatement({
+        effect: iam.Effect.ALLOW,
+        actions: ["s3:ListBucket"],
+        resources: [params.documentBucket.bucketArn],
+        conditions: {
+          StringLike: {
+            "s3:prefix": ["content/", "content/*"],
+          },
+        },
+      }),
+    );
+
+    // 2b. Source bucket: reading objects
     params.knowledgeBaseRole.addToPolicy(
       new iam.PolicyStatement({
         effect: iam.Effect.ALLOW,
@@ -313,6 +344,7 @@ export class AwsBedrockStack extends cdk.Stack {
       }),
     );
 
+    // 3. Vector store: identity-based policy on the role
     params.knowledgeBaseRole.addToPolicy(
       new iam.PolicyStatement({
         actions: [
@@ -328,6 +360,7 @@ export class AwsBedrockStack extends cdk.Stack {
       }),
     );
 
+    // 4. Vector store: resource-based policy on the vector bucket
     const vectorBucketPolicy = new s3vectors.CfnVectorBucketPolicy(
       this,
       "MyVectorBucketPolicy",
@@ -358,6 +391,7 @@ export class AwsBedrockStack extends cdk.Stack {
       },
     );
 
+    // 5. add dependency so vectorBucketPolicy is created before KB
     params.knowledgeBase.node.addDependency(vectorBucketPolicy);
   }
 
@@ -403,7 +437,11 @@ export class AwsBedrockStack extends cdk.Stack {
     askQuestionLambda.addToRolePolicy(
       new iam.PolicyStatement({
         effect: iam.Effect.ALLOW,
-        actions: ["bedrock:RetrieveAndGenerate"],
+        actions: [
+          "bedrock:RetrieveAndGenerate",
+          "bedrock:Retrieve",
+          "bedrock:InvokeModel",
+        ],
         resources: ["*"],
       }),
     );
@@ -444,5 +482,209 @@ export class AwsBedrockStack extends cdk.Stack {
       // development environment to minimise cost. For production update policy to RETAIN
       removalPolicy: cdk.RemovalPolicy.DESTROY,
     });
+  }
+
+  private createCoordinatorLambda(params: {
+    knowledgeBaseId: string;
+    dataSourceId: string;
+    ingestionStateTable: dynamodb.Table;
+  }): lambdaNodejs.NodejsFunction {
+    const coordinatorLambda = new lambdaNodejs.NodejsFunction(
+      this,
+      "IngestionCoordinatorLambda",
+      {
+        entry: "lambda/ingestion-coordinator/index.ts",
+        handler: "handler",
+        runtime: lambda.Runtime.NODEJS_22_X,
+        timeout: cdk.Duration.seconds(30),
+        environment: {
+          KNOWLEDGE_BASE_ID: params.knowledgeBaseId,
+          DATA_SOURCE_ID: params.dataSourceId,
+          INGESTION_STATE_TABLE_NAME: params.ingestionStateTable.tableName,
+        },
+      },
+    );
+
+    params.ingestionStateTable.grantReadWriteData(coordinatorLambda);
+
+    return coordinatorLambda;
+  }
+
+  private createIngestionStateMachine(params: {
+    coordinatorLambda: lambdaNodejs.NodejsFunction;
+    knowledgeBaseId: string;
+    dataSourceId: string;
+  }): sfn.StateMachine {
+    // 1. Acquire lock
+    const acquireLock = new tasks.LambdaInvoke(this, "AcquireIngestionLock", {
+      lambdaFunction: params.coordinatorLambda,
+      payload: sfn.TaskInput.fromObject({
+        action: "ACQUIRE",
+        executionId: sfn.JsonPath.executionId,
+      }),
+      outputPath: "$.Payload",
+    });
+
+    // 2. Start Bedrock ingestion
+    const startIngestion = new tasks.CallAwsService(
+      this,
+      "StartBedrockIngestion",
+      {
+        service: "bedrockagent",
+        action: "startIngestionJob",
+        parameters: {
+          KnowledgeBaseId: params.knowledgeBaseId,
+          DataSourceId: params.dataSourceId,
+        },
+        iamResources: ["*"], // @TODO: check this
+        resultPath: "$.startResult",
+      },
+    );
+
+    startIngestion.addRetry({
+      errors: ["BedrockAgent.ConflictException"],
+      interval: cdk.Duration.seconds(30),
+      maxAttempts: 10,
+      backoffRate: 1,
+    });
+
+    // 3. Wait before checking status
+    const waitForIngestion = new sfn.Wait(this, "WaitForIngestion", {
+      time: sfn.WaitTime.duration(cdk.Duration.seconds(30)),
+    });
+    startIngestion.next(waitForIngestion);
+
+    // 4. Get Bedrock ingestion status
+    const getIngestionStatus = new tasks.CallAwsService(
+      this,
+      "GetBedrockIngestionStatus",
+      {
+        service: "bedrockagent",
+        action: "getIngestionJob",
+        parameters: {
+          KnowledgeBaseId: params.knowledgeBaseId,
+          DataSourceId: params.dataSourceId,
+          IngestionJobId: sfn.JsonPath.stringAt(
+            "$.startResult.IngestionJob.IngestionJobId",
+          ),
+        },
+        iamResources: ["*"],
+        resultPath: "$.getResult",
+      },
+    );
+
+    // 5. Finalize successful ingestion
+    const finalize = new tasks.LambdaInvoke(this, "FinalizeIngestion", {
+      lambdaFunction: params.coordinatorLambda,
+      payload: sfn.TaskInput.fromObject({
+        action: "FINALIZE",
+        executionId: sfn.JsonPath.executionId,
+        processedGeneration: sfn.JsonPath.numberAt("$.generation"),
+      }),
+      resultPath: "$.finalizeResult",
+    });
+
+    // 6. Handle failed ingestion
+    const releaseFailedLock = new tasks.LambdaInvoke(
+      this,
+      "ReleaseFailedIngestionLock",
+      {
+        lambdaFunction: params.coordinatorLambda,
+        payload: sfn.TaskInput.fromObject({
+          action: "FAIL",
+          executionId: sfn.JsonPath.executionId,
+          error: "Bedrock ingestion job failed or stopped",
+        }),
+        resultPath: "$.failureResult",
+      },
+    );
+
+    startIngestion.addCatch(releaseFailedLock, {
+      resultPath: "$.error",
+    });
+
+    getIngestionStatus.addCatch(releaseFailedLock, {
+      resultPath: "$.error",
+    });
+
+    const ingestionFailed = new sfn.Fail(this, "IngestionFailed", {
+      cause: "Bedrock knowledge base ingestion failed",
+      error: "BedrockIngestionFailed",
+    });
+
+    releaseFailedLock.next(ingestionFailed);
+
+    // 7. Check ingestion status
+    const checkIngestionStatus = new sfn.Choice(this, "CheckIngestionStatus");
+
+    checkIngestionStatus
+      .when(
+        sfn.Condition.stringEquals(
+          "$.getResult.IngestionJob.Status",
+          "COMPLETE",
+        ),
+        finalize,
+      )
+      .when(
+        sfn.Condition.or(
+          sfn.Condition.stringEquals(
+            "$.getResult.IngestionJob.Status",
+            "FAILED",
+          ),
+          sfn.Condition.stringEquals(
+            "$.getResult.IngestionJob.Status",
+            "STOPPED",
+          ),
+        ),
+        releaseFailedLock,
+      )
+      .otherwise(waitForIngestion);
+
+    waitForIngestion.next(getIngestionStatus);
+    getIngestionStatus.next(checkIngestionStatus);
+
+    // 8. Check whether another ingestion is required
+    const checkMoreUploads = new sfn.Choice(this, "CheckForMoreUploads");
+
+    checkMoreUploads
+      .when(
+        sfn.Condition.booleanEquals(
+          "$.finalizeResult.Payload.needsAnotherIngestion",
+          true,
+        ),
+        acquireLock,
+      )
+      .otherwise(new sfn.Succeed(this, "IngestionCompleted"));
+
+    finalize.next(checkMoreUploads);
+
+    // 9. Start only if lock was acquired
+    const lockNotAcquired = new sfn.Succeed(this, "AnotherIngestionIsRunning");
+
+    const checkLock = new sfn.Choice(this, "CheckLockAcquired");
+
+    checkLock
+      .when(sfn.Condition.booleanEquals("$.acquired", true), startIngestion)
+      .otherwise(lockNotAcquired);
+
+    acquireLock.next(checkLock);
+
+    const stateMachine = new sfn.StateMachine(this, "IngestionStateMachine", {
+      stateMachineName: "bedrock-ingestion-coordinator",
+      stateMachineType: sfn.StateMachineType.STANDARD,
+      definitionBody: sfn.DefinitionBody.fromChainable(acquireLock),
+      timeout: cdk.Duration.hours(2),
+    });
+
+    // Bedrock Agent API permissions
+    stateMachine.addToRolePolicy(
+      new iam.PolicyStatement({
+        effect: iam.Effect.ALLOW,
+        actions: ["bedrock:StartIngestionJob", "bedrock:GetIngestionJob"],
+        resources: ["*"],
+      }),
+    );
+
+    return stateMachine;
   }
 }
